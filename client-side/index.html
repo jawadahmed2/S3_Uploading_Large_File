@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resumable Multipart S3 Upload</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        #progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #e0e0e0;
+            margin-top: 10px;
+        }
+        #progress {
+            width: 0;
+            height: 100%;
+            background-color: #76c7c0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Resumable Multipart S3 Upload</h1>
+    <input type="file" id="file-input">
+    <button id="upload-btn">Upload</button>
+    <div id="progress-bar">
+        <div id="progress"></div>
+    </div>
+    <script>
+        const API_BASE_URL = '<Lambda function URL>'; // Replace with your Lambda function's URL endpoint
+
+        const uploadFile = async () => {
+            const fileInput = document.getElementById('file-input');
+            if (!fileInput.files.length) {
+                alert('Please select a file.');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            const chunkSize = 5 * 1024 * 1024; // 5 MB
+            const totalChunks = Math.ceil(file.size / chunkSize);
+
+            const progressBar = document.getElementById('progress');
+            progressBar.style.width = '0%';
+
+            let uploadId = null;
+            let key = null;
+            let uploadedParts = [];
+
+            try {
+                // Check if there's an ongoing upload session
+                const savedState = JSON.parse(localStorage.getItem(file.name));
+                if (savedState) {
+                    // Resume upload
+                    uploadId = savedState.uploadId;
+                    key = savedState.key;
+
+                    // List uploaded parts from the server
+                    const listPartsResponse = await fetch(`${API_BASE_URL}/list-parts`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uploadId, key })
+                    });
+                    const { parts } = await listPartsResponse.json();
+                    uploadedParts = parts;
+                } else {
+                    // Start new upload session
+                    const initResponse = await fetch(`${API_BASE_URL}/start-multipart-upload`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ fileName: file.name })
+                    });
+                    const result = await initResponse.json();
+                    uploadId = result.uploadId;
+                    key = result.key;
+
+                    // Save state to localStorage
+                    localStorage.setItem(file.name, JSON.stringify({ uploadId, key }));
+                }
+
+                // Upload remaining parts
+                const parts = [...uploadedParts]; // Start with already uploaded parts
+                for (let i = 0; i < totalChunks; i++) {
+                    const start = i * chunkSize;
+                    const end = Math.min(start + chunkSize, file.size);
+                    const chunk = file.slice(start, end);
+
+                    // Skip already uploaded parts
+                    if (uploadedParts.some(p => p.PartNumber === i + 1)) continue;
+
+                    // Get pre-signed URL for this part
+                    const urlResponse = await fetch(`${API_BASE_URL}/get-presigned-url`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uploadId, key, partNumber: i + 1 })
+                    });
+                    const { presignedUrl } = await urlResponse.json();
+
+                    // Upload the chunk
+                    const uploadResponse = await fetch(presignedUrl, {
+                        method: 'PUT',
+                        body: chunk
+                    });
+
+                    if (!uploadResponse.ok) {
+                        console.error(`Failed to upload part ${i + 1}`);
+                        alert(`Failed to upload part ${i + 1}.`);
+                        return;
+                    }
+
+                    // Capture ETag
+                    const eTag = uploadResponse.headers.get('ETag');
+                    parts.push({ PartNumber: i + 1, ETag: eTag.replace(/"/g, '') });
+
+                    // Update progress
+                    progressBar.style.width = `${((i + 1) / totalChunks) * 100}%`;
+
+                    // Save progress
+                    localStorage.setItem(file.name, JSON.stringify({ uploadId, key, parts }));
+                }
+
+                // Complete multipart upload
+                const completeResponse = await fetch(`${API_BASE_URL}/complete-multipart-upload`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uploadId, key, parts })
+                });
+
+                if (completeResponse.ok) {
+                    alert('File uploaded successfully!');
+                    localStorage.removeItem(file.name); // Clean up
+                } else {
+                    alert('Error completing upload.');
+                }
+            } catch (error) {
+                console.error('Error during upload:', error);
+                alert('An error occurred during the upload process.');
+            }
+        };
+
+        document.getElementById('upload-btn').addEventListener('click', uploadFile);
+    </script>
+</body>
+</html>
